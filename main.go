@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"sync"
+	"time"
 )
 
 type Port struct {
@@ -141,12 +141,16 @@ func main() {
 		log.Fatal(err)
 	}
 	wg := sync.WaitGroup{}
+	wg.Add(10)
+	start := time.Now()
 	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			PortService.Submit(Port{Id: i, City: fmt.Sprintf("City %d", i)})
-		}(i)
+		go func() {
+			PortService.Submit(Port{Id: i, City: "Boston"})
+			wg.Done()
+		}()
+
 	}
 	wg.Wait()
+	duration := time.Since(start)
+	log.Print(duration.Microseconds())
 }
