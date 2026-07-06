@@ -186,10 +186,10 @@ func main() {
 
 	}
 	duration := time.Since(start)
-	log.Print(duration.Microseconds())
 	wg.Wait()
 	for _, k := range chans {
 		<-k
 	}
+	log.Print(duration.Microseconds())
 
 }
