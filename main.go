@@ -4,23 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"sync"
+	"time"
 )
 
 type Port struct {
 	Id   int    `json:"id"`
 	City string `json:"city"`
 }
+type PortCh struct {
+	Port Port
+	Recv chan struct{}
+}
 type PortService struct {
 	Ctx         context.Context
 	cancel      context.CancelFunc
+	recv        chan PortCh
 	m           sync.Mutex
 	path        string
 	buffer_path string
+	is_working  chan struct{}
 }
 
 func InitPortService(p string) (*PortService, error) {
@@ -33,16 +39,23 @@ func InitPortService(p string) (*PortService, error) {
 		file.Close()
 	}
 	ctx, c := context.WithCancel(context.Background())
-	return &PortService{
+	s := &PortService{
 		Ctx:         ctx,
 		cancel:      c,
 		m:           sync.Mutex{},
 		path:        p,
 		buffer_path: p + ".tmp",
-	}, nil
+		recv:        make(chan PortCh, 1000),
+		is_working:  make(chan struct{}),
+	}
+
+	go s.startWork()
+	return s, nil
 }
 func (p *PortService) Shutdown() {
 	p.cancel()
+	<-p.is_working
+	log.Print("closing port service")
 }
 func (p *PortService) write(ports []Port) error {
 	file, err := os.Create(p.path)
@@ -61,92 +74,122 @@ func (p *PortService) write(ports []Port) error {
 
 	return nil
 }
-
-func (p *PortService) Submit(port Port) error {
-	p.m.Lock()
-	defer p.m.Unlock()
-	if p.Ctx.Err() != nil {
-		return errors.New("closed port service")
+func (p *PortService) Submit(port Port) (<-chan struct{}, error) {
+	send := PortCh{
+		Port: port,
+		Recv: make(chan struct{}),
 	}
-	var rename bool
-
-	defer func() {
-		if rename {
-			if err := os.Rename(p.buffer_path, p.path); err != nil {
-				log.Print(err)
-			}
-		}
-	}()
-	file, err := os.Open(p.path)
-	if err != nil {
-
-		return errors.New("open file err:" + err.Error())
+	select {
+	case p.recv <- send:
+		return send.Recv, nil
+	case <-p.Ctx.Done():
+		return nil, errors.New("closed port service")
 	}
-	defer file.Close()
-	decoder := json.NewDecoder(file)
-	var close_buffer_file bool
-	var IsFound bool
-	defer func() {
-		if close_buffer_file {
-			os.Remove(p.buffer_path)
-		}
-	}()
-	buffer, err := os.Create(p.buffer_path)
-	if err != nil {
-
-		return errors.New("create buffer err:" + err.Error())
-	}
-	defer buffer.Close()
-	encoder := json.NewEncoder(buffer)
+}
+func (p *PortService) startWork() {
+	defer close(p.is_working)
 	for {
-		//make
-		findport := Port{}
-		//read
-		if err := decoder.Decode(&findport); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
+		//make notice chan
+
+		if p.Ctx.Err() != nil {
+			log.Print("context closed before start of work")
+			return
 		}
-		//check
-		if findport.Id == port.Id {
-			IsFound = true
-			if findport == port {
-				close_buffer_file = true
-				return errors.New("already stored")
+		select {
+		case <-p.Ctx.Done():
+			return
+		case req := <-p.recv:
+			file, err := os.Open(p.path)
+			if err != nil {
+				log.Print(err)
+				return
 			}
-			findport = port
-		}
-		//write
-		if err := encoder.Encode(findport); err != nil {
-			close_buffer_file = true
-			return err
+			decoder := json.NewDecoder(file)
+			buffer, err := os.Create(p.buffer_path)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			encoder := json.NewEncoder(buffer)
+			close_buffer := false
+			for {
+				port := Port{}
+				if err := decoder.Decode(&port); err == io.EOF {
+					log.Print("end of file")
+					if err := encoder.Encode(req.Port); err != nil {
+						close_buffer = true
+
+						log.Print(err)
+						break
+					}
+					break
+				} else if err != nil {
+					close_buffer = true
+
+					log.Print(err)
+				}
+				if req.Port.Id == port.Id {
+					log.Print("port found")
+					if req.Port == port {
+						log.Print("this value already stored")
+						//this value already stored
+						close_buffer = true
+						break
+					}
+					port = req.Port
+				}
+				if err := encoder.Encode(port); err != nil {
+					close_buffer = true
+
+					log.Print(err)
+					break
+				}
+
+			}
+			//buffer file
+			file.Close()
+			buffer.Close()
+
+			if close_buffer {
+				log.Print("deleting buffer file")
+				os.Remove(p.buffer_path)
+			} else {
+				os.Rename(p.buffer_path, p.path)
+
+			}
+			log.Print("new data stored")
+			close(req.Recv)
 		}
 
 	}
-	if !IsFound {
-		if err := encoder.Encode(port); err != nil {
-			close_buffer_file = true
-			return err
-		}
-	}
-	//change files
-	rename = true
-	return nil
 
 }
 func main() {
-
 	PortService, err := InitPortService("ports.ndjson")
 	if err != nil {
 		log.Fatal(err)
 	}
+	chans := make([]<-chan struct{}, 0, 10)
 	wg := sync.WaitGroup{}
+	wg.Add(10)
+	start := time.Now()
 	for i := 0; i < 10; i++ {
-		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			PortService.Submit(Port{Id: i, City: fmt.Sprintf("City %d", i)})
+			recv, err := PortService.Submit(Port{Id: i, City: "boston"})
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			chans = append(chans, recv)
 		}(i)
+
 	}
+	duration := time.Since(start)
+	log.Print(duration.Microseconds())
 	wg.Wait()
+	for _, k := range chans {
+		<-k
+	}
+
 }
