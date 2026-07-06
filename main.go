@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -139,6 +140,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	PortService.Submit(Port{Id: 1, City: "fds"})
+	wg := sync.WaitGroup{}
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			PortService.Submit(Port{Id: i, City: fmt.Sprintf("City %d", i)})
+		}(i)
+	}
+	wg.Wait()
 }
