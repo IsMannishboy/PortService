@@ -2,194 +2,304 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 )
 
+//ERRORS
+
+var AlreadyStoredPort = errors.New("lready stored")
+
+// /
+type BinPort struct {
+	Id   [16]byte
+	City [100]byte
+}
 type Port struct {
-	Id   int    `json:"id"`
-	City string `json:"city"`
+	Id   int
+	City string
 }
-type PortCh struct {
+type ChanPort struct {
 	Port Port
-	Recv chan struct{}
+	Ch   chan RespCh
 }
+type RespCh struct {
+	Err error
+	Msg string
+}
+
+var SIZE = int64(unsafe.Sizeof(BinPort{}))
+
 type PortService struct {
-	Ctx         context.Context
-	cancel      context.CancelFunc
-	recv        chan PortCh
-	m           sync.Mutex
-	path        string
-	buffer_path string
-	is_working  chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	recv       chan ChanPort
+	size       int
+	batch_size int
+	file_name  string
 }
 
-func InitPortService(p string) (*PortService, error) {
-	//check file
-	if file, err := os.Open(p); err != nil {
-		//create
+var PortServiceClosed = errors.New("PortServiceClosed")
 
-		os.Create(p)
-	} else {
-		file.Close()
+func (p *PortService) Submit(port Port) (error, chan RespCh) {
+	if p.ctx.Err() != nil {
+		return PortServiceClosed, nil
 	}
+	ch_port := ChanPort{Port: port, Ch: make(chan RespCh, 1)}
+	select {
+	case <-p.ctx.Done():
+		return PortServiceClosed, nil
+	case p.recv <- ch_port:
+		return nil, ch_port.Ch
+	}
+}
+func InitPortService(size int, byte_size int, wg *sync.WaitGroup, file_name string) (*PortService, error) {
+	file, err := os.OpenFile(file_name, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	file.Close()
+
 	ctx, c := context.WithCancel(context.Background())
-	s := &PortService{
-		Ctx:         ctx,
-		cancel:      c,
-		m:           sync.Mutex{},
-		path:        p,
-		buffer_path: p + ".tmp",
-		recv:        make(chan PortCh, 1000),
-		is_working:  make(chan struct{}),
+	p := &PortService{
+		ctx:        ctx,
+		cancel:     c,
+		recv:       make(chan ChanPort),
+		size:       size,
+		batch_size: byte_size,
+		file_name:  file_name,
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p.Run()
 
-	go s.startWork()
-	return s, nil
+	}()
+	return p, nil
 }
-func (p *PortService) Shutdown() {
-	p.cancel()
-	<-p.is_working
-	log.Print("closing port service")
+func readChunk(file *os.File, batch_size int, size int) (int, []byte, error) {
+	//read buffer
+	buff := make([]byte, batch_size*size)
+	n, err := io.ReadFull(file, buff)
+	if err != nil {
+		if err == io.ErrUnexpectedEOF {
+
+			buff = buff[:n]
+
+		} else {
+			return n, nil, err
+		}
+
+	}
+	return n, buff, nil
 }
-func (p *PortService) write(ports []Port) error {
-	file, err := os.Create(p.path)
+func rewriteChunk(file *os.File, bs int, ports []Port, n int) error {
+	//bin
+	bin_ports := make([]BinPort, 0, bs)
+	for i := 0; i < len(ports); i++ {
+		bin_ports = append(bin_ports, MakePort(ports[i]))
+	}
+	_, err := file.Seek(int64(-n), io.SeekCurrent)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-
-	for _, port := range ports {
-		if err := encoder.Encode(port); err != nil {
-			return err
-		}
+	err = binary.Write(file, binary.LittleEndian, bin_ports)
+	if err != nil {
+		log.Fatal("write buffer err: ", err)
+		return err
 	}
-
 	return nil
-}
-func (p *PortService) Submit(port Port) (<-chan struct{}, error) {
-	send := PortCh{
-		Port: port,
-		Recv: make(chan struct{}),
-	}
-	select {
-	case p.recv <- send:
-		return send.Recv, nil
-	case <-p.Ctx.Done():
-		return nil, errors.New("closed port service")
-	}
-}
-func (p *PortService) startWork() {
-	defer close(p.is_working)
-	for {
-		//make notice chan
 
-		if p.Ctx.Err() != nil {
-			log.Print("context closed before start of work")
-			return
-		}
+}
+func (p *PortService) Run() {
+	for {
 		select {
-		case <-p.Ctx.Done():
+		case <-p.ctx.Done():
 			return
 		case req := <-p.recv:
-			file, err := os.Open(p.path)
+			port := req.Port
+			resp := req.Ch
+			//read
+			file, err := os.OpenFile(p.file_name, os.O_RDWR, 0644)
 			if err != nil {
-				log.Print(err)
-				return
+				log.Fatal("file open err:", err)
+
 			}
-			decoder := json.NewDecoder(file)
-			buffer, err := os.Create(p.buffer_path)
-			if err != nil {
-				log.Print(err)
-				return
-			}
-			encoder := json.NewEncoder(buffer)
-			close_buffer := false
+			resp_str := RespCh{}
+
+			offset := 0
 			for {
-				port := Port{}
-				if err := decoder.Decode(&port); err == io.EOF {
-					log.Print("end of file")
-					if err := encoder.Encode(req.Port); err != nil {
-						close_buffer = true
+				n, buff, read_err := readChunk(file, p.batch_size, p.size)
+				if read_err != nil {
+					if read_err == io.EOF {
+						bin := MakePort(port)
+						err = binary.Write(file, binary.LittleEndian, bin)
+						if err != nil {
+							log.Fatal(err)
+							resp_str.Err = err
+							resp <- RespCh{Err: err}
+						}
+						resp <- RespCh{Err: nil}
+						break
 
-						log.Print(err)
+					}
+				}
+				log.Print("readed ", n, " bytes")
+				//to json
+				ports := BufferToJSON(buff)
+				for i := 0; i < len(ports); i++ {
+					if ports[i].Id == port.Id {
+						if ports[i] == port {
+							//already stored
+							resp_str = RespCh{Err: AlreadyStoredPort}
+							break
+						}
+						ports[i] = port
+						resp_str = RespCh{Err: nil, Msg: "Changed"}
 						break
 					}
-					break
-				} else if err != nil {
-					close_buffer = true
-
-					log.Print(err)
 				}
-				if req.Port.Id == port.Id {
-					log.Print("port found")
-					if req.Port == port {
-						log.Print("this value already stored")
-						//this value already stored
-						close_buffer = true
-						break
+				if resp_str.Err != nil {
+					resp <- resp_str
+					break
+				} else if resp_str.Msg == "Changed" {
+					//bin
+					err := rewriteChunk(file, p.batch_size, ports, n)
+					if err != nil {
+						log.Print("rewriteChunk err :", err)
+						resp_str.Err = err
+						resp_str.Msg = "write err"
 					}
-					port = req.Port
-				}
-				if err := encoder.Encode(port); err != nil {
-					close_buffer = true
+					resp <- resp_str
 
-					log.Print(err)
 					break
 				}
+
+				offset += len(buff) * p.size
 
 			}
-			//buffer file
+
 			file.Close()
-			buffer.Close()
+			close(req.Ch)
 
-			if close_buffer {
-				log.Print("deleting buffer file")
-				os.Remove(p.buffer_path)
-			} else {
-				os.Rename(p.buffer_path, p.path)
-
-			}
-			log.Print("new data stored")
-			close(req.Recv)
 		}
-
 	}
 
 }
-func main() {
-	PortService, err := InitPortService("ports.ndjson")
+func (p *PortService) Shutdown() {
+
+	p.cancel()
+}
+func MakePort(portt Port) BinPort {
+	port := BinPort{}
+	str := strconv.Itoa(portt.Id)
+	id_limit := len(str)
+	if id_limit > len(port.Id) {
+		id_limit = len(port.Id)
+	}
+	for i := 0; i < id_limit; i++ {
+		port.Id[i] = str[i]
+	}
+
+	citylimit := len(portt.City)
+	if citylimit > len(port.City) {
+		citylimit = len(port.City)
+	}
+	for i := 0; i < citylimit; i++ {
+		port.City[i] = portt.City[i]
+	}
+	return port
+
+}
+func bytesToString(b []byte) string {
+	n := 0
+	for n < len(b) && b[n] != 0 {
+		n++
+	}
+	return string(b[:n])
+}
+func BinToJson(bin BinPort) Port {
+	idStr := bytesToString(bin.Id[:])
+	city := bytesToString(bin.City[:])
+
+	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	chans := make([]<-chan struct{}, 0, 10)
+
+	return Port{
+		Id:   id,
+		City: city,
+	}
+}
+func BufferToJSON(buff []byte) []Port {
+	var ports []Port
+	for i := 0; i < len(buff); i += int(SIZE) {
+		chunk := buff[i : i+int(SIZE)]
+
+		var p BinPort
+		copy(p.Id[:], chunk[0:16])
+		copy(p.City[:], chunk[16:SIZE])
+
+		ports = append(ports, BinToJson(p))
+	}
+	return ports
+}
+
+func main() {
+	//INIT
 	wg := sync.WaitGroup{}
-	wg.Add(10)
+	s, err := InitPortService(int(unsafe.Sizeof(BinPort{})), 100, &wg, "file.bin")
+	if err != nil {
+		log.Fatal(err)
+	}
+	//test
+	test_wg := sync.WaitGroup{}
+	test_wg.Add(10)
 	start := time.Now()
 	for i := 0; i < 10; i++ {
-		go func(i int) {
-			defer wg.Done()
-			recv, err := PortService.Submit(Port{Id: i, City: "boston"})
+		go func() {
+			defer test_wg.Done()
+			err, _ := s.Submit(Port{Id: i, City: "Boston"})
 			if err != nil {
-				log.Print(err)
-				return
+				log.Fatal("submit err:", err)
 			}
-			chans = append(chans, recv)
-		}(i)
+		}()
 
 	}
-	duration := time.Since(start)
-	log.Print(duration.Microseconds())
-	wg.Wait()
-	for _, k := range chans {
-		<-k
+	test_wg.Wait()
+
+	diff := time.Since(start)
+	s.Shutdown()
+	//check
+	f, err := os.Open("file.bin")
+	if err != nil {
+		log.Fatal(err)
 	}
+	b := make([]byte, SIZE*100)
+
+	n, err := io.ReadFull(f, b)
+	if err != nil {
+		log.Print(err)
+		if err == io.ErrUnexpectedEOF {
+			b = b[:n]
+		} else {
+			log.Fatal(err)
+
+		}
+	}
+	log.Print("readed :", n)
+	ports := BufferToJSON(b)
+	log.Print(ports)
+	wg.Wait()
+	log.Print(time.Duration(diff) * time.Microsecond)
 
 }
